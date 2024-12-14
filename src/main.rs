@@ -1,5 +1,4 @@
 use pixels::{Error, Pixels, SurfaceTexture};
-use rand::Rng;
 use winit::{
     dpi::PhysicalSize,
     event::{Event, VirtualKeyCode, WindowEvent},
@@ -7,25 +6,38 @@ use winit::{
     window::WindowBuilder,
 };
 
-const DT: f32 = 0.1;    // Time step size
-const VISC: f32 = 0.001; // Viscosity of the fluid
-const NITER: usize = 20; // Number of solver iterations
+// Core simulation parameters
+const DT: f32 = 0.016;    // Time step targeting 60 FPS
+const VISC: f32 = 0.001;  // Fluid viscosity - controls flow turbulence
+const NITER: usize = 8;   // Solver iteration count - balance of accuracy vs performance
+
+// Display configuration
+const VIRTUAL_WIDTH: u32 = 150;   // Internal simulation grid width
+const VIRTUAL_HEIGHT: u32 = 150;  // Internal simulation grid height
+const UPSCALE: u32 = 4;          // Window scaling multiplier
+const ACTUAL_WIDTH: u32 = VIRTUAL_WIDTH * UPSCALE;    // Physical window width
+const ACTUAL_HEIGHT: u32 = VIRTUAL_HEIGHT * UPSCALE;  // Physical window height
+
+// Simulation parameters
+const LID_VELOCITY: f32 = 10.0;  // Speed of the top wall driving the flow
 
 fn main() -> Result<(), Error> {
     let event_loop = EventLoop::new();
 
     let window = WindowBuilder::new()
         .with_title("Simple CFD Simulation")
+        .with_inner_size(PhysicalSize::new(ACTUAL_WIDTH, ACTUAL_HEIGHT)) // Larger window size
         .build(&event_loop)
         .unwrap();
 
     let size = window.inner_size();
     let mut pixels = {
         let surface_texture = SurfaceTexture::new(size.width, size.height, &window);
-        Pixels::new(size.width, size.height, surface_texture)?
+        // Use virtual resolution for the pixel buffer
+        Pixels::new(VIRTUAL_WIDTH, VIRTUAL_HEIGHT, surface_texture)?
     };
 
-    let mut simulation = Simulation::new(size.width as usize, size.height as usize);
+    let mut simulation = Simulation::new(VIRTUAL_WIDTH as usize, VIRTUAL_HEIGHT as usize);
 
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Poll;
@@ -44,18 +56,20 @@ fn main() -> Result<(), Error> {
             }
             Event::WindowEvent { event, .. } => match event {
                 WindowEvent::Resized(new_size) => {
-                    pixels.resize_surface(new_size.width, new_size.height);
-                    pixels.resize_buffer(new_size.width, new_size.height);
+                    pixels.resize_surface(new_size.width, new_size.height).unwrap();
+                    // Keep the buffer at virtual resolution
+                    pixels.resize_buffer(VIRTUAL_WIDTH, VIRTUAL_HEIGHT).unwrap();
 
-                    simulation = Simulation::new(new_size.width as usize, new_size.height as usize);
+                    simulation = Simulation::new(VIRTUAL_WIDTH as usize, VIRTUAL_HEIGHT as usize);
                 }
                 WindowEvent::ScaleFactorChanged { new_inner_size, .. } => {
-                    pixels.resize_surface(new_inner_size.width, new_inner_size.height);
-                    pixels.resize_buffer(new_inner_size.width, new_inner_size.height);
+                    pixels.resize_surface(new_inner_size.width, new_inner_size.height).unwrap();
+                    // Keep the buffer at virtual resolution
+                    pixels.resize_buffer(VIRTUAL_WIDTH, VIRTUAL_HEIGHT).unwrap();
 
                     simulation = Simulation::new(
-                        new_inner_size.width as usize,
-                        new_inner_size.height as usize,
+                        VIRTUAL_WIDTH as usize,
+                        VIRTUAL_HEIGHT as usize,
                     );
                 }
                 WindowEvent::CloseRequested
@@ -75,12 +89,12 @@ fn main() -> Result<(), Error> {
 }
 
 struct Simulation {
-    width: usize,
-    height: usize,
-    u: Vec<f32>,
-    v: Vec<f32>,
-    u_prev: Vec<f32>,
-    v_prev: Vec<f32>,
+    width: usize,     // Grid width
+    height: usize,    // Grid height
+    u: Vec<f32>,      // Horizontal velocity field
+    v: Vec<f32>,      // Vertical velocity field
+    u_prev: Vec<f32>, // Previous horizontal velocity state
+    v_prev: Vec<f32>, // Previous vertical velocity state
 }
 
 impl Simulation {
@@ -104,46 +118,59 @@ impl Simulation {
         let visc = VISC;
         let size = self.width * self.height;
         
-        // Create temporary vectors for calculations
+        // Allocate scratch space for intermediate calculations
         let mut u_temp = vec![0.0; size];
         let mut v_temp = vec![0.0; size];
         
-        // Step 1: Add source
+        // Phase 1: Apply external forces
         for i in 0..size {
             u_temp[i] = self.u[i] + dt * self.u_prev[i];
             v_temp[i] = self.v[i] + dt * self.v_prev[i];
         }
         
-        // Step 2: Diffuse
+        // Phase 2: Apply viscous diffusion
         self.diffuse_step(1, &mut u_temp, &self.u, visc, dt);
         self.diffuse_step(2, &mut v_temp, &self.v, visc, dt);
         
-        // Step 3: Project
+        // Phase 3: Enforce mass conservation
         self.project_step(&mut u_temp, &mut v_temp);
         
-        // Step 4: Advect
+        // Phase 4: Transport velocities
         let (mut u_next, mut v_next) = (vec![0.0; size], vec![0.0; size]);
         self.advect_step(1, &mut u_next, &u_temp, &u_temp, &v_temp, dt);
         self.advect_step(2, &mut v_next, &v_temp, &u_temp, &v_temp, dt);
         
-        // Step 5: Project again
+        // Phase 5: Final mass conservation step
         self.project_step(&mut u_next, &mut v_next);
         
-        // Update final values
+        // Update velocity fields with new values
         self.u.copy_from_slice(&u_next);
         self.v.copy_from_slice(&v_next);
     }
 
     fn draw(&self, frame: &mut [u8]) {
+        // Scale factor for mapping simulation grid to display resolution
+        let scale_factor = (self.width * self.height) as f32 / (VIRTUAL_WIDTH * VIRTUAL_HEIGHT) as f32;
+        
+        // Convert velocity field to color pixels
         for (i, pixel) in frame.chunks_exact_mut(4).enumerate() {
-            let speed = (self.u[i].powi(2) + self.v[i].powi(2)).sqrt();
+            // Map display coordinates to simulation grid
+            let vx = (i % VIRTUAL_WIDTH as usize) as f32;
+            let vy = (i / VIRTUAL_WIDTH as usize) as f32;
+            let sx = (vx * scale_factor) as usize;
+            let sy = (vy * scale_factor) as usize;
+            let si = sy * self.width + sx;
+            
+            // Calculate fluid speed at this point
+            let speed = (self.u[si].powi(2) + self.v[si].powi(2)).sqrt();
             let value = (speed * 10.0).clamp(0.0, 1.0);
-            let (r, g, b) = hsv_to_rgb(value * 240.0, 1.0, 1.0);
-
-            pixel[0] = (r * 255.0) as u8; // R
-            pixel[1] = (g * 255.0) as u8; // G
-            pixel[2] = (b * 255.0) as u8; // B
-            pixel[3] = 0xff;              // A
+            
+            // Convert to RGBA color
+            let (r, g, b) = spectrum_color(value);
+            pixel[0] = r;
+            pixel[1] = g;
+            pixel[2] = b;
+            pixel[3] = 0xff;  // Full opacity
         }
     }
 
@@ -155,8 +182,8 @@ impl Simulation {
             let top = x;
             let bottom = (h - 1) * w + x;
 
-            // Top boundary (lid) moving with velocity u = 1.0
-            self.u[top] = 1.0;
+            // Top boundary (lid) moving with increased velocity u = 2.0
+            self.u[top] = LID_VELOCITY;
             self.v[top] = 0.0;
 
             // Bottom boundary
@@ -176,57 +203,6 @@ impl Simulation {
             self.u[right] = 0.0;
             self.v[right] = 0.0;
         }
-    }
-
-    fn add_source(&self, x: &mut [f32], s: &[f32]) {
-        for i in 0..x.len() {
-            x[i] += DT * s[i];
-        }
-    }
-
-    fn diffuse(&self, b: usize, x: &mut [f32], x0: &[f32], diff: f32, dt: f32) {
-        let a = dt * diff * (self.width - 2) as f32 * (self.height - 2) as f32;
-        self.linear_solve(b, x, x0, a, 1.0 + 4.0 * a);
-    }
-
-    fn advect(
-        &self,
-        b: usize,
-        d: &mut [f32],
-        d0: &[f32],
-        u: &[f32],
-        v: &[f32],
-        dt: f32,
-    ) {
-        let nx = self.width as f32;
-        let ny = self.height as f32;
-        let dt0x = dt * (nx - 2.0);
-        let dt0y = dt * (ny - 2.0);
-
-        for j in 1..self.height - 1 {
-            for i in 1..self.width - 1 {
-                let idx = j * self.width + i;
-                let mut x = i as f32 - dt0x * u[idx];
-                let mut y = j as f32 - dt0y * v[idx];
-
-                x = x.clamp(0.5, nx - 1.5);
-                y = y.clamp(0.5, ny - 1.5);
-
-                let i0 = x.floor() as usize;
-                let i1 = i0 + 1;
-                let j0 = y.floor() as usize;
-                let j1 = j0 + 1;
-
-                let s1 = x - i0 as f32;
-                let s0 = 1.0 - s1;
-                let t1 = y - j0 as f32;
-                let t0 = 1.0 - t1;
-
-                d[idx] = s0 * (t0 * d0[j0 * self.width + i0] + t1 * d0[j1 * self.width + i0]) +
-                         s1 * (t0 * d0[j0 * self.width + i1] + t1 * d0[j1 * self.width + i1]);
-            }
-        }
-        self.set_bnd(b, d);
     }
 
     fn project(
@@ -293,13 +269,16 @@ impl Simulation {
     }
 
     fn set_bnd(&self, b: usize, x: &mut [f32]) {
+        // Handle boundary conditions for velocity components
+        // b=1: horizontal velocity, b=2: vertical velocity
         let w = self.width;
         let h = self.height;
 
+        // Apply boundary conditions to edges
         for i in 1..w - 1 {
-            // Top and bottom boundaries
-            x[i] = if b == 2 { -x[w + i] } else { x[w + i] }; // Top
-            x[(h - 1) * w + i] = if b == 2 { -x[(h - 2) * w + i] } else { x[(h - 2) * w + i] }; // Bottom
+            x[i] = if b == 2 { -x[w + i] } else { x[w + i] };                    // Top wall
+            x[(h - 1) * w + i] = if b == 2 { -x[(h - 2) * w + i] } 
+                                 else { x[(h - 2) * w + i] };                     // Bottom wall
         }
 
         for j in 1..h - 1 {
@@ -369,20 +348,17 @@ impl Simulation {
     }
 }
 
-// Add HSV to RGB conversion function
-fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (f32, f32, f32) {
-    let c = v * s;
-    let x = c * (1.0 - ((h / 60.0) % 2.0 - 1.0).abs());
-    let m = v - c;
-
-    let (r, g, b) = match h {
-        h if h < 60.0 => (c, x, 0.0),
-        h if h < 120.0 => (x, c, 0.0),
-        h if h < 180.0 => (0.0, c, x),
-        h if h < 240.0 => (0.0, x, c),
-        h if h < 300.0 => (x, 0.0, c),
-        _ => (c, 0.0, x),
+// Color mapping function for visualization
+// Maps scalar values to a color gradient: Red → Yellow → Green → Cyan → Blue
+fn spectrum_color(t: f32) -> (u8, u8, u8) {
+    let t = t * 4.0; // Expand input to cover four color transitions
+    
+    let (r, g, b) = match t.floor() as i32 {
+        0 => (255, (t * 255.0) as u8, 0),                    // Red → Yellow
+        1 => ((255.0 * (2.0 - t)) as u8, 255, 0),           // Yellow → Green
+        2 => (0, 255, ((t - 2.0) * 255.0) as u8),           // Green → Cyan
+        _ => (0, (255.0 * (4.0 - t)) as u8, 255)            // Cyan → Blue
     };
-
-    (r + m, g + m, b + m)
+    
+    (r, g, b)
 }
